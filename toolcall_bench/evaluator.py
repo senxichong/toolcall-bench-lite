@@ -90,8 +90,17 @@ class Evaluator:
         selection = ToolSelectionAccuracy.evaluate(task, turn)
         arguments = ArgumentMatch.evaluate(task, turn)
         schema = SchemaValidity.evaluate(task, turn, self.registry)
+        if final_turn is not None:
+            schema = (
+                schema
+                and final_turn.schema_valid
+                and final_turn.tool_call is None
+                and final_turn.content is not None
+            )
         execution_ok = ExecutionSuccess.evaluate(task, turn, execution)
-        final_answer = FinalAnswerAccuracy.evaluate(task, answer)
+        final_answer = (
+            final_turn is None or final_turn.tool_call is None
+        ) and FinalAnswerAccuracy.evaluate(task, answer)
 
         actual_tool = None if turn.tool_call is None else turn.tool_call.name
         actual_arguments = None if turn.tool_call is None else turn.tool_call.arguments
@@ -219,4 +228,3 @@ def evaluate(
     """Functional shortcut for ``Evaluator(registry).evaluate(...)``."""
 
     return Evaluator(registry).evaluate(task, turn, execution, final_turn)
-

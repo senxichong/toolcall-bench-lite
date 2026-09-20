@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -33,6 +34,40 @@ def _reject_unknown(data: Mapping[str, Any], allowed: set[str], model: str) -> N
     if unknown:
         names = ", ".join(unknown)
         raise SchemaValidationError(f"unknown {model} field(s): {names}")
+
+
+_SENSITIVE_KEYS = {
+    "api_key", "access_token", "refresh_token", "authorization", "password",
+    "client_secret", "secret_key", "private_key",
+}
+_BEARER_PATTERN = re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/-]+")
+_API_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|client[_-]?secret)"
+    r"[\"']?\s*[:=]\s*[\"']?([^\s,\"'}]+)"
+)
+
+
+def _redact_sensitive(value: Any) -> Any:
+    """Redact common credential shapes only at serialization boundaries."""
+
+    if isinstance(value, Mapping):
+        return {
+            key: (
+                "[REDACTED]" if isinstance(key, str) and key.casefold().replace("-", "_") in _SENSITIVE_KEYS
+                else _redact_sensitive(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_sensitive(item) for item in value]
+    if isinstance(value, str):
+        text = _BEARER_PATTERN.sub(r"\1[REDACTED]", value)
+        text = _API_KEY_PATTERN.sub("[REDACTED]", text)
+        return _ASSIGNMENT_PATTERN.sub(r"\1=[REDACTED]", text)
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +156,41 @@ class ToolCall:
 
 
 @dataclass(frozen=True, slots=True)
+class TokenUsage:
+    """Provider-reported token counts for one model response.
+
+    Counts are optional because local and mock backends may not report usage.
+    """
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+                raise SchemaValidationError(f"{name} must be a non-negative integer or null")
+
+    def to_dict(self) -> dict[str, int | None]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> TokenUsage:
+        raw = _require_mapping(data, "token usage")
+        _reject_unknown(raw, {"prompt_tokens", "completion_tokens", "total_tokens"}, "token usage")
+        return cls(
+            prompt_tokens=raw.get("prompt_tokens"),
+            completion_tokens=raw.get("completion_tokens"),
+            total_tokens=raw.get("total_tokens"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AgentTurn:
     """Normalized output from a model adapter."""
 
@@ -129,6 +199,7 @@ class AgentTurn:
     raw: Any = None
     schema_valid: bool = True
     error: str | None = None
+    token_usage: TokenUsage | None = None
 
     def __post_init__(self) -> None:
         if self.content is not None and not isinstance(self.content, str):
@@ -137,6 +208,8 @@ class AgentTurn:
             raise SchemaValidationError("agent turn schema_valid must be a boolean")
         if self.error is not None and not isinstance(self.error, str):
             raise SchemaValidationError("agent turn error must be a string or null")
+        if self.token_usage is not None and not isinstance(self.token_usage, TokenUsage):
+            raise SchemaValidationError("agent turn token_usage must be TokenUsage or null")
 
     @property
     def final_answer(self) -> str | None:
@@ -151,6 +224,7 @@ class AgentTurn:
             "raw": self.raw,
             "schema_valid": self.schema_valid,
             "error": self.error,
+            "token_usage": None if self.token_usage is None else self.token_usage.to_dict(),
         }
 
     @classmethod
@@ -158,16 +232,18 @@ class AgentTurn:
         raw = _require_mapping(data, "agent turn")
         _reject_unknown(
             raw,
-            {"content", "tool_call", "raw", "schema_valid", "error"},
+            {"content", "tool_call", "raw", "schema_valid", "error", "token_usage"},
             "agent turn",
         )
         call = raw.get("tool_call")
+        usage = raw.get("token_usage")
         return cls(
             content=raw.get("content"),
             tool_call=None if call is None else ToolCall.from_dict(call),
             raw=raw.get("raw"),
             schema_valid=raw.get("schema_valid", True),
             error=raw.get("error"),
+            token_usage=None if usage is None else TokenUsage.from_dict(usage),
         )
 
 
@@ -408,6 +484,94 @@ class TaskEvaluation:
 
 
 @dataclass(frozen=True, slots=True)
+class TraceStep:
+    """One ordered model or tool event in an agent execution.
+
+    ``input_messages`` is a snapshot, so later conversation updates cannot rewrite
+    the historical trace. ``model_output`` retains the provider-native response.
+    """
+
+    step_index: int
+    kind: str
+    user_input: str
+    latency_ms: float
+    input_messages: list[dict[str, Any]] | None = None
+    model_output: Any = None
+    selected_tool: str | None = None
+    tool_arguments: dict[str, Any] | None = None
+    tool_response: ToolExecutionResult | None = None
+    token_usage: TokenUsage | None = None
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.step_index, bool) or not isinstance(self.step_index, int) or self.step_index < 0:
+            raise SchemaValidationError("trace step_index must be a non-negative integer")
+        if self.kind not in {"model", "tool"}:
+            raise SchemaValidationError("trace kind must be model or tool")
+        _require_string(self.user_input, "trace user_input")
+        if isinstance(self.latency_ms, bool) or not isinstance(self.latency_ms, (int, float)) or self.latency_ms < 0:
+            raise SchemaValidationError("trace latency_ms must be non-negative")
+        if self.input_messages is not None:
+            if not isinstance(self.input_messages, list):
+                raise SchemaValidationError("trace input_messages must be a list or null")
+            for message in self.input_messages:
+                _require_mapping(message, "trace input message")
+        if self.selected_tool is not None:
+            _require_string(self.selected_tool, "trace selected_tool")
+        if self.tool_arguments is not None:
+            _require_mapping(self.tool_arguments, "trace tool_arguments")
+        if self.tool_response is not None and not isinstance(self.tool_response, ToolExecutionResult):
+            raise SchemaValidationError("trace tool_response must be ToolExecutionResult or null")
+        if self.token_usage is not None and not isinstance(self.token_usage, TokenUsage):
+            raise SchemaValidationError("trace token_usage must be TokenUsage or null")
+        if self.error is not None and not isinstance(self.error, str):
+            raise SchemaValidationError("trace error must be a string or null")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "step_index": self.step_index,
+            "kind": self.kind,
+            "user_input": self.user_input,
+            "latency_ms": self.latency_ms,
+            "input_messages": self.input_messages,
+            "model_output": self.model_output,
+            "selected_tool": self.selected_tool,
+            "tool_arguments": self.tool_arguments,
+            "tool_response": None if self.tool_response is None else self.tool_response.to_dict(),
+            "token_usage": None if self.token_usage is None else self.token_usage.to_dict(),
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> TraceStep:
+        raw = _require_mapping(data, "trace step")
+        allowed = {
+            "step_index", "kind", "user_input", "latency_ms", "input_messages",
+            "model_output", "selected_tool", "tool_arguments", "tool_response",
+            "token_usage", "error",
+        }
+        _reject_unknown(raw, allowed, "trace step")
+        for required in ("step_index", "kind", "user_input", "latency_ms"):
+            if required not in raw:
+                raise SchemaValidationError(f"trace step is missing field: {required}")
+        response = raw.get("tool_response")
+        usage = raw.get("token_usage")
+        return cls(
+            step_index=raw["step_index"],
+            kind=raw["kind"],
+            user_input=raw["user_input"],
+            latency_ms=raw["latency_ms"],
+            input_messages=raw.get("input_messages"),
+            model_output=raw.get("model_output"),
+            selected_tool=raw.get("selected_tool"),
+            tool_arguments=raw.get("tool_arguments"),
+            tool_response=None if response is None else ToolExecutionResult.from_dict(response),
+            token_usage=None if usage is None else TokenUsage.from_dict(usage),
+            error=raw.get("error"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class TaskRunResult:
     """Complete trace and evaluation for one task."""
 
@@ -417,6 +581,7 @@ class TaskRunResult:
     evaluation: TaskEvaluation
     final_turn: AgentTurn | None = None
     latency_ms: float = 0.0
+    trace: list[TraceStep] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.task.task_id != self.evaluation.task_id:
@@ -427,6 +592,12 @@ class TaskRunResult:
             raise SchemaValidationError("latency_ms must be a number")
         if self.latency_ms < 0:
             raise SchemaValidationError("latency_ms must not be negative")
+        if not isinstance(self.trace, list) or not all(isinstance(step, TraceStep) for step in self.trace):
+            raise SchemaValidationError("trace must be a list of TraceStep")
+        if any(step.user_input != self.task.prompt for step in self.trace):
+            raise SchemaValidationError("trace user_input must match task prompt")
+        if any(step.step_index != index for index, step in enumerate(self.trace)):
+            raise SchemaValidationError("trace step_index must match event order")
 
     @property
     def task_id(self) -> str:
@@ -440,15 +611,37 @@ class TaskRunResult:
             return self.final_turn.content
         return self.turn.content
 
+    @property
+    def token_usage(self) -> TokenUsage | None:
+        """Sum reported usage across model turns without inventing missing counts."""
+
+        usages = [step.token_usage for step in self.trace if step.token_usage is not None]
+        if not usages:
+            return None
+
+        def sum_field(name: str) -> int | None:
+            values = [getattr(usage, name) for usage in usages]
+            return sum(value for value in values if value is not None) if any(
+                value is not None for value in values
+            ) else None
+
+        return TokenUsage(
+            prompt_tokens=sum_field("prompt_tokens"),
+            completion_tokens=sum_field("completion_tokens"),
+            total_tokens=sum_field("total_tokens"),
+        )
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "task": self.task.to_dict(),
             "turn": self.turn.to_dict(),
             "execution": None if self.execution is None else self.execution.to_dict(),
             "evaluation": self.evaluation.to_dict(),
             "final_turn": None if self.final_turn is None else self.final_turn.to_dict(),
             "latency_ms": self.latency_ms,
+            "trace": [step.to_dict() for step in self.trace],
         }
+        return _redact_sensitive(data)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> TaskRunResult:
@@ -462,6 +655,7 @@ class TaskRunResult:
                 "evaluation",
                 "final_turn",
                 "latency_ms",
+                "trace",
             },
             "task run result",
         )
@@ -472,6 +666,9 @@ class TaskRunResult:
                 )
         execution = raw.get("execution")
         final_turn = raw.get("final_turn")
+        trace = raw.get("trace", [])
+        if not isinstance(trace, list):
+            raise SchemaValidationError("task run trace must be a list")
         return cls(
             task=BenchmarkTask.from_dict(raw["task"]),
             turn=AgentTurn.from_dict(raw["turn"]),
@@ -481,6 +678,7 @@ class TaskRunResult:
             evaluation=TaskEvaluation.from_dict(raw["evaluation"]),
             final_turn=None if final_turn is None else AgentTurn.from_dict(final_turn),
             latency_ms=raw.get("latency_ms", 0.0),
+            trace=[TraceStep.from_dict(step) for step in trace],
         )
 
 
@@ -538,7 +736,7 @@ class RunReport:
         return summary
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "model": self.model,
             "created_at": self.created_at,
             "benchmark": self.benchmark,
@@ -546,6 +744,7 @@ class RunReport:
             "summary": self.summary(),
             "results": [result.to_dict() for result in self.results],
         }
+        return _redact_sensitive(data)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> RunReport:

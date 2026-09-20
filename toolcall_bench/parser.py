@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from .schemas import AgentTurn, SchemaValidationError, ToolCall
+from .schemas import AgentTurn, SchemaValidationError, TokenUsage, ToolCall
 
 
 def parse_agent_response(raw: Any) -> AgentTurn:
@@ -55,13 +55,34 @@ def parse_agent_response(raw: Any) -> AgentTurn:
     if content is None and tool_call is None:
         errors.append("assistant message contains neither content nor a valid tool call")
     error = "; ".join(dict.fromkeys(errors)) or None
+    token_usage = _parse_usage(raw.get("usage"))
     return AgentTurn(
         content=content,
         tool_call=tool_call,
         raw=raw,
         schema_valid=not errors,
         error=error,
+        token_usage=token_usage,
     )
+
+
+def _parse_usage(raw: Any) -> TokenUsage | None:
+    """Normalize OpenAI and common local-server usage names when available."""
+
+    if not isinstance(raw, Mapping):
+        return None
+    prompt = raw.get("prompt_tokens", raw.get("input_tokens"))
+    completion = raw.get("completion_tokens", raw.get("output_tokens"))
+    total = raw.get("total_tokens")
+    values = (prompt, completion, total)
+    if not any(value is not None for value in values):
+        return None
+    if any(
+        value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0)
+        for value in values
+    ):
+        return None
+    return TokenUsage(prompt_tokens=prompt, completion_tokens=completion, total_tokens=total)
 
 
 def _unwrap_message(raw: Mapping[str, Any]) -> tuple[Mapping[str, Any] | None, str | None]:
@@ -132,4 +153,3 @@ def _invalid(raw: Any, message: str) -> AgentTurn:
 
 
 parse_response = parse_agent_response
-

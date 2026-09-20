@@ -26,9 +26,20 @@ runs/*.json
 runs/*.md
 !runs/.gitkeep
 
+# Local dataset snapshots and service state
+datasets/
+*.db
+*.sqlite
+*.sqlite3
+
+# Dashboard dependencies and build output
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.npm-cache/
+dashboard/*.tsbuildinfo
+
 # Editors and operating systems
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
-

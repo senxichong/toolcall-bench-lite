@@ -11,9 +11,10 @@ import json
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Callable
 
 from .schemas import ToolSpec
 
@@ -22,8 +23,8 @@ class ModelAdapterError(RuntimeError):
     """Raised when an adapter cannot obtain a model response."""
 
 
-class ModelAdapter(ABC):
-    """Small provider-neutral interface for one chat-completion turn."""
+class LLMBackend(ABC):
+    """Provider-neutral interface for one agent model turn."""
 
     name = "model"
 
@@ -39,6 +40,10 @@ class ModelAdapter(ABC):
         """Compatibility alias with a more conversational method name."""
 
         return self.generate(messages, tools)
+
+
+class ModelAdapter(LLMBackend):
+    """Backward-compatible name for the public LLM backend contract."""
 
 
 class MockAgent(ModelAdapter):
@@ -307,6 +312,16 @@ class OpenAICompatibleAdapter(ModelAdapter):
         if not self.api_key:
             raise ModelAdapterError("Set TOOLCALL_BENCH_API_KEY before using this adapter")
 
+        parsed_url = urllib.parse.urlsplit(self.base_url)
+        if (
+            parsed_url.scheme not in {"http", "https"}
+            or not parsed_url.netloc
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or parsed_url.query
+            or parsed_url.fragment
+        ):
+            raise ModelAdapterError("Model base URL must be an HTTP(S) URL without credentials")
         endpoint = self.base_url.rstrip("/")
         if not endpoint.endswith("/chat/completions"):
             endpoint += "/chat/completions"
@@ -330,15 +345,16 @@ class OpenAICompatibleAdapter(ModelAdapter):
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 payload = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise ModelAdapterError(f"Model endpoint returned HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise ModelAdapterError(f"Could not reach model endpoint: {exc.reason}") from exc
+            # Provider bodies commonly echo Authorization or request data. Never
+            # copy them into exceptions, traces, or persisted reports.
+            raise ModelAdapterError(f"Model endpoint returned HTTP {exc.code}") from None
+        except (urllib.error.URLError, TimeoutError):
+            raise ModelAdapterError("Could not reach model endpoint") from None
 
         try:
             parsed = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise ModelAdapterError("Model endpoint returned invalid JSON") from exc
+        except json.JSONDecodeError:
+            raise ModelAdapterError("Model endpoint returned invalid JSON") from None
         if not isinstance(parsed, dict):
             raise ModelAdapterError("Model endpoint response must be a JSON object")
         return parsed
@@ -355,5 +371,92 @@ class OpenAICompatibleAdapter(ModelAdapter):
         }
 
 
+class LocalModelBackend(ModelAdapter):
+    """Lazy local text-generation backend using optional ``transformers``.
+
+    A compatible callable may be injected for tests or an existing inference
+    runtime. It receives a JSON-formatted prompt and generation keyword arguments.
+    No model is loaded until the first ``generate`` call.
+    """
+
+    name = "local"
+
+    def __init__(
+        self,
+        model: str,
+        generator: Callable[..., Any] | None = None,
+        max_new_tokens: int = 512,
+    ) -> None:
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("local model must be a non-empty string")
+        if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be a positive integer")
+        self.model = model
+        self._generator = generator
+        self.max_new_tokens = max_new_tokens
+
+    def _load_generator(self) -> Callable[..., Any]:
+        if self._generator is None:
+            try:
+                from transformers import pipeline
+            except ImportError:
+                raise ModelAdapterError(
+                    "Local inference requires the optional transformers package"
+                ) from None
+            try:
+                self._generator = pipeline(
+                    task="text-generation", model=self.model, trust_remote_code=False
+                )
+            except Exception:
+                # Model paths, registry credentials, and remote error bodies are
+                # intentionally omitted from persisted benchmark failures.
+                raise ModelAdapterError("Could not initialize local model") from None
+        return self._generator
+
+    def generate(
+        self, messages: list[dict[str, Any]], tools: list[ToolSpec]
+    ) -> dict[str, Any] | str:
+        prompt = (
+            "You are a tool-calling assistant. Return one JSON object with either "
+            "{\"content\": \"answer\"} or {\"tool_calls\": [{\"type\": \"function\", "
+            "\"function\": {\"name\": \"tool_name\", \"arguments\": {}}}]}. "
+            "Use at most one tool call. Available tools and conversation follow.\n"
+            + json.dumps(
+                {"tools": [tool.to_openai_tool() for tool in tools], "messages": messages},
+                ensure_ascii=False,
+            )
+            + "\nAssistant JSON:"
+        )
+        try:
+            generated = self._load_generator()(
+                prompt, max_new_tokens=self.max_new_tokens, do_sample=False
+            )
+        except ModelAdapterError:
+            raise
+        except Exception:
+            raise ModelAdapterError("Local model generation failed") from None
+        if isinstance(generated, list):
+            generated = generated[0] if generated else None
+        if isinstance(generated, dict) and "generated_text" in generated:
+            generated = generated["generated_text"]
+        if isinstance(generated, list) and generated and isinstance(generated[-1], dict):
+            generated = generated[-1]
+        if isinstance(generated, dict) and generated.get("role") == "assistant":
+            generated = generated.get("content")
+        if isinstance(generated, dict):
+            return generated
+        if not isinstance(generated, str):
+            raise ModelAdapterError("Local model returned an unsupported response")
+        completion = generated[len(prompt):] if generated.startswith(prompt) else generated
+        completion = completion.strip()
+        try:
+            decoded = json.loads(completion)
+        except json.JSONDecodeError:
+            return {"content": completion}
+        return decoded if isinstance(decoded, dict) else {"content": completion}
+
+
 # A convenient alias used by early examples of the project.
 MockAdapter = MockAgent
+MockBackend = MockAgent
+LocalModelAdapter = LocalModelBackend

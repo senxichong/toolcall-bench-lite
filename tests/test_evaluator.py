@@ -72,6 +72,29 @@ def test_missing_required_argument_fails_schema_and_execution():
     assert not evaluation.execution_success
 
 
+def test_second_tool_call_cannot_score_as_valid_final_answer():
+    final = parse_agent_response(
+        {
+            "content": "4",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {"name": "calculator", "arguments": '{"expression":"2 + 2"}'},
+                }
+            ],
+        }
+    )
+    evaluation = Evaluator().evaluate(
+        make_task(),
+        tool_turn(),
+        ToolExecutionResult(success=True, value=4, tool_name="calculator"),
+        final,
+    )
+    assert not evaluation.schema_valid
+    assert not evaluation.final_answer_correct
+    assert not evaluation.overall_success
+
+
 def test_correct_no_call_scores_as_success():
     task = make_task(
         expected_tool=None,

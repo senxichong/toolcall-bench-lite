@@ -2,249 +2,122 @@
 
 [![CI](https://github.com/senxichong/toolcall-bench-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/senxichong/toolcall-bench-lite/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**A small, deterministic evaluation framework for LLM tool calling—from tool selection and arguments to execution and the final answer.**
+一个可追踪的 LLM Agent 工具调用评测平台。相同数据集可用于确定性 Mock、OpenAI 兼容接口及本地模型；平台提供五项指标、完整模型／工具调用轨迹、结构化失败分析，以及可选的 FastAPI + React 仪表盘。服务部署使用 PostgreSQL 保存数据、Redis + Celery 执行异步评测。
 
-ToolCall-Bench-Lite is deliberately narrow: standard-library runtime, five local tools, one tool step, transparent Boolean metrics, JSONL tasks, and JSON/Markdown reports. It is meant to be understood in an afternoon and extended without adopting a full agent platform.
+**注意：**Mock 在示例数据集上的成绩仅用于验证评测链路，不代表真实大模型的能力。
 
-## The 20-second example
+## 快速开始：离线命令行
+
+需要 Python 3.10 或更新版本。
 
 ```bash
 python -m pip install -e ".[dev]"
 toolcall-bench run benchmarks/demo.jsonl
-```
-
-```text
-Completed 25 tasks with adapter 'mock'.
-Overall success: 25/25 (100.0%)
-JSON: runs/latest.json
-Markdown: runs/latest.md
-```
-
-The default `MockAgent` is deterministic, reads only the prompt/tool schemas/results, and needs no API key or network. Its perfect demo score is a regression check that the framework is wired correctly—not evidence about a real LLM.
-
-## Architecture
-
-```mermaid
-flowchart LR
-    A[JSONL task] --> B[ModelAdapter]
-    T[Available ToolSpec list] --> B
-    B -->|assistant output| C[Parser]
-    C --> D{Tool call?}
-    D -->|yes| E[Allowlist + schema validation]
-    E --> F[Local ToolRegistry execution]
-    F -->|structured result| B
-    D -->|no| G[Final answer]
-    B -->|post-tool answer| G
-    C --> H[Selection / arguments / schema]
-    F --> I[Execution success]
-    G --> J[Final answer accuracy]
-    H --> K[JSON + Markdown report]
-    I --> K
-    J --> K
-```
-
-The parser is intentionally separate from adapters. Malformed model output becomes a scored failure rather than an exception that aborts the run. Tool calls are checked against each task's allowlist and JSON Schema before the Python function is reached.
-
-## Quick Start
-
-Requirements: Python 3.10 or newer.
-
-```bash
-git clone https://github.com/senxichong/toolcall-bench-lite.git
-cd toolcall-bench-lite
-python -m pip install -e ".[dev]"
-
-# Run the deterministic offline demo and create both reports.
-toolcall-bench run benchmarks/demo.jsonl
-
-# Re-render Markdown from an existing JSON run.
-toolcall-bench report runs/latest.json
-
-# Quality checks used by CI.
+python -m pytest
 ruff check .
-pytest
 ```
 
-You can also run the package without the console-script installation:
+示例包含 25 道任务及 5 个确定性的本地工具，无需密钥或联网。结果写入 `runs/latest.json`、`runs/latest.md` 和 `runs/latest.badcases.json`。
 
-```bash
-python -m toolcall_bench run benchmarks/demo.jsonl
-```
-
-### OpenAI-compatible endpoint
-
-The optional adapter uses the standard library and an OpenAI-compatible `/chat/completions` endpoint. Configuration is environment-based; the project contains no key and never requires an external API for its default workflow.
+评测 OpenAI 兼容的 Chat Completions 接口：
 
 ```bash
 export TOOLCALL_BENCH_MODEL="your-model"
 export TOOLCALL_BENCH_BASE_URL="https://your-endpoint.example/v1"
-export TOOLCALL_BENCH_API_KEY="your-key"
-
-toolcall-bench run benchmarks/demo.jsonl --adapter openai-compatible
+export TOOLCALL_BENCH_API_KEY="your-secret"
+toolcall-bench run benchmarks/demo.jsonl --adapter openai-compatible --output runs/model-a.json
 ```
 
-PowerShell uses `$env:TOOLCALL_BENCH_MODEL = "your-model"` (and the same pattern for the other variables). The API key has no CLI flag, which helps keep it out of shell history.
+PowerShell 中使用 `$env:TOOLCALL_BENCH_MODEL = "your-model"` 设置环境变量，其他变量同理。密钥没有命令行参数，避免写入命令历史。本地推理先执行 `python -m pip install -e ".[local]"`，再使用 `--adapter local --model 模型标识或路径`。模型首次调用时才加载，输出质量取决于模型遵循工具调用 JSON 格式的能力。
 
-## Built-in tools
+## 数据集格式与版本管理
 
-All tools are deterministic and local. Nothing accesses the internet.
-
-| Tool | Arguments | Purpose |
-|---|---|---|
-| `calculator` | `expression: string` | Safely evaluates bounded arithmetic with Python AST; never calls `eval`. |
-| `get_word_length` | `word: string` | Counts Unicode code points. |
-| `convert_temperature` | `value`, `from_unit`, `to_unit` | Converts Celsius, Fahrenheit, and Kelvin. |
-| `lookup_product` | `product_id: string` | Reads a fixed in-memory catalog. |
-| `search_mock_database` | `query`, optional `category`, optional `limit` | Searches fixed local records. |
-
-## Benchmark Format
-
-Benchmarks are UTF-8 JSONL: one self-contained task per line.
+基准数据采用 UTF-8 JSONL，每行一条任务：
 
 ```json
 {"task_id":"calc_001","prompt":"What is 25 * 16?","available_tools":["calculator"],"expected_tool":"calculator","expected_arguments":{"expression":"25 * 16"},"expected_answer":"400","answer_match":"exact"}
 ```
 
-| Field | Type | Meaning |
-|---|---|---|
-| `task_id` | string | Unique stable identifier. |
-| `prompt` | string | User request shown to the model. |
-| `available_tools` | string array | Per-task allowlist and distractor set. |
-| `expected_tool` | string or `null` | Gold tool; `null` means the correct behavior is no call. |
-| `expected_arguments` | object | Gold arguments; must be empty for a no-call task. |
-| `expected_answer` | any JSON value | Gold final answer. Objects/arrays can be compared structurally. |
-| `answer_match` | string | `auto`, `exact`, `json`, `numeric`, or `contains`. |
-| `metadata` | object, optional | Dataset annotations not used for scoring. |
-
-The bundled 25 tasks cover tool choice, distractor tools, argument extraction, missing required information, structured JSON, and requests that need no tool.
-
-## Evaluation Metrics
-
-Every task receives five independent Boolean metrics plus an all-or-nothing result:
-
-| Metric | Pass condition |
-|---|---|
-| **Tool Selection Accuracy** | Called tool equals `expected_tool`; a correct no-call also passes. |
-| **Argument Match** | Keys and nested structure match; numbers use a small tolerance and arithmetic expressions are compared as normalized ASTs. |
-| **Schema Validity** | Assistant structure is parseable, tool is advertised, and arguments satisfy the tool's JSON Schema. |
-| **Execution Success** | The selected local tool returns successfully; a correctly expected no-call passes. |
-| **Final Answer Accuracy** | The answer passes the task's exact, normalized, numeric, contains, or structural JSON comparison. |
-| **Overall Success** | All five metrics pass for that task. |
-
-JSON reports preserve the expected/actual values, parser errors, tool errors, individual task traces, aggregate counts, and rates. Markdown is generated only from that JSON-compatible run object.
-
-## Adding a New Tool
-
-Define a normal Python function, describe its arguments with the supported JSON Schema subset, then register the pair:
-
-```python
-from toolcall_bench import ToolRegistry, ToolSpec
-
-
-def reverse_text(text: str) -> str:
-    return text[::-1]
-
-
-registry = ToolRegistry().add(
-    ToolSpec(
-        name="reverse_text",
-        description="Reverse a string.",
-        parameters={
-            "type": "object",
-            "properties": {"text": {"type": "string"}},
-            "required": ["text"],
-            "additionalProperties": False,
-        },
-    ),
-    reverse_text,
-)
-```
-
-Pass the registry to `BenchmarkRunner(adapter, registry)`. See [`examples/custom_tool.py`](examples/custom_tool.py) for a runnable version. Prefer deterministic, side-effect-free functions in evaluation datasets.
-
-## Adding a New Task
-
-Append one valid JSON object to a benchmark file. The expected tool must appear in `available_tools`; use `null` and `{}` when asking for clarification or answering directly is correct.
-
-```json
-{"task_id":"word_005","prompt":"How many characters are in \"agent\"?","available_tools":["calculator","get_word_length"],"expected_tool":"get_word_length","expected_arguments":{"word":"agent"},"expected_answer":"5","answer_match":"exact"}
-```
-
-`load_tasks()` rejects malformed JSON, missing/unknown fields, duplicate IDs, duplicate tool names, and inconsistent no-call gold data with a source line number.
-
-## Adding a New Model
-
-Implement one provider-neutral method. Return a direct assistant message, an OpenAI-compatible response envelope, or a plain answer string; parsing stays inside the framework.
-
-```python
-from toolcall_bench import ModelAdapter
-
-
-class MyAdapter(ModelAdapter):
-    name = "my-model"
-
-    def generate(self, messages, tools):
-        provider_tools = [tool.to_openai_tool() for tool in tools]
-        return my_client.complete(messages=messages, tools=provider_tools)
-```
-
-The runner calls the same method again after a tool result. Adapters should not read benchmark gold fields. They receive only messages and allowed `ToolSpec` objects.
-
-## Results
-
-The following numbers were produced locally with the committed `benchmarks/demo.jsonl` and deterministic `MockAgent` using the Quick Start command:
-
-| Adapter | Tasks | Tool selection | Arguments | Schema | Execution | Final answer | Overall |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| `MockAgent` | 25 | 25/25 | 25/25 | 25/25 | 25/25 | 25/25 | 25/25 |
-
-This row is reproducible framework validation, not a comparative LLM experiment. No real-model metric is reported because none was run. Use each generated `runs/latest.json` as the source of truth for new results.
-
-## Project Layout
-
-```text
-toolcall_bench/
-  schemas.py    # typed tasks, traces, metric results, run reports
-  tools.py      # registry, schema checks, five local tools
-  tasks.py      # strict JSONL loading and writing
-  agent.py      # ModelAdapter, MockAgent, OpenAI-compatible adapter
-  parser.py     # provider-output normalization
-  evaluator.py  # five metrics and overall success
-  runner.py     # one-call execution loop
-  report.py     # JSON-backed Markdown rendering
-  cli.py        # run/report commands
-benchmarks/demo.jsonl
-examples/
-tests/
-docs/interview.md
-```
-
-## Limitations
-
-- One tool call per task; parallel and multi-step trajectories are not yet executed.
-- Only a practical JSON Schema subset is implemented, not the full specification.
-- Final answers use deterministic comparators, not semantic or LLM-as-judge grading.
-- Argument gold has one canonical call, so equally valid alternative plans are not represented.
-- The built-in tools are tiny fixtures and do not model network latency, permissions, or changing data.
-- The OpenAI-compatible adapter targets chat completions and may need a small subclass for provider-specific formats.
-
-## Roadmap
-
-- Multi-step and parallel tool-call trajectories with step budgets.
-- Field-level partial credit and multiple acceptable gold calls.
-- Async adapters, retries, timeouts, and richer provider diagnostics.
-- Dataset versioning and benchmark slices/tags.
-- Optional semantic answer graders with explicit judge provenance.
-- Sandboxed connectors and side-effect policies for realistic agents.
-
-## Development
+`expected_tool` 可为 `null`，表示正确行为是不调用工具。`answer_match` 支持 `auto`、`exact`、`json`、`numeric` 和 `contains`；可选 `metadata` 保存任务标签。加载器会拒绝格式错误、重复任务 ID 和不一致的标准答案。
 
 ```bash
-ruff check .
-pytest
+toolcall-bench dataset import arithmetic benchmarks/demo.jsonl
+toolcall-bench dataset list --name arithmetic
+toolcall-bench dataset verify arithmetic --version v000001
+toolcall-bench dataset export arithmetic exported.jsonl --version v000001
+toolcall-bench dataset diff arithmetic v000001 v000002
+toolcall-bench run --dataset-name arithmetic --dataset-version v000001
 ```
 
-GitHub Actions runs the same checks on pushes and pull requests. The project is available under the [MIT License](LICENSE).
+数据集默认位于 `datasets/`；用 `toolcall-bench dataset --root 路径 ...` 修改管理目录，评测时用 `toolcall-bench run --datasets-dir 路径 ...` 指定相同目录。导入生成带任务数量和 SHA-256 摘要的不可变版本；再次导入内容相同的数据会返回原版本。运行报告保留数据集名称、版本和摘要。导出支持 JSONL 与 JSON 数组。
 
+## 评测架构
+
+`LLMBackend.generate(messages, tools)` 是模型无关的接口。内置 `MockBackend`、`OpenAICompatibleAdapter` 与 `LocalModelBackend`；旧名称 `ModelAdapter` 和 `MockAgent` 继续兼容。后端只接收对话和允许使用的工具定义，不接收标准答案。
+
+运行器解析模型输出，验证任务工具白名单和参数 Schema，调用 `ToolRegistry`，再执行评测。每道任务保存按时间排序的模型／工具事件：用户输入、输入消息、原始模型输出、所选工具、参数、工具响应、延迟、可用的 Token 用量及错误。单个模型或工具异常会被记录为任务失败，不会直接中断整批评测。
+
+| 指标 | 通过条件 |
+|---|---|
+| 工具选择准确率 | 所选工具与标准工具相同；正确地不调用工具也算通过。 |
+| 参数正确性 | 参数结构与标准参数匹配；算术表达式支持规范化比较。 |
+| Schema 有效性 | 响应可解析，工具在白名单内，参数满足已支持的 JSON Schema 子集。 |
+| 执行成功率 | 工具调用成功，或任务本就无需工具调用。 |
+| 最终答案质量 | 答案满足任务配置的确定性匹配规则。 |
+
+五项全部通过才计为整体成功。Badcase 分析会标记 `wrong_tool`、`wrong_arguments`、`tool_failure`、`reasoning_failure`，保存主要类别、其他适用类别、预期与实际结果及轨迹。这里的 `reasoning_failure` 表示可观察的答案错误，并不声称能够判断模型内部思维过程。
+
+## API、任务队列与仪表盘
+
+仅在本机体验 API，可使用 SQLite 与同步 Mock 演示模式：
+
+```bash
+python -m pip install -e ".[service]"
+export TOOLCALL_DEMO_MODE=true
+uvicorn toolcall_bench.service.app:app --reload
+```
+
+API 文档位于 `http://localhost:8000/docs`。单独开发 React 仪表盘需要 Node.js 20.19+：
+
+```bash
+cd dashboard
+npm ci
+npm run dev
+```
+
+部署 PostgreSQL、Redis、Celery 和仪表盘时，先参照 `.env.example` 在 `.env` 中设置强随机 `POSTGRES_PASSWORD`，再运行：
+
+```bash
+docker compose up --build -d
+```
+
+默认本机地址为仪表盘 `http://localhost:3000`、API `http://localhost:8000/api`、接口文档 `http://localhost:8000/docs`。模型凭据应通过服务端环境变量 `TOOLCALL_BENCH_*` 配置，不应放入评测请求。默认 Docker 镜像不包含本地大模型推理的 `transformers` / `torch` 依赖；需要自建含 `[local]` 依赖的 Worker 镜像才能在容器内使用本地后端。
+
+API 提供数据集创建／导入／列表／详情／导出、评测提交与任务状态、运行详情与 badcase、统计及对比。PostgreSQL 保存不可变的数据集 `(名称, 版本)` 快照与完整运行报告；普通模式通过 Redis 将任务交给 Celery Worker。仪表盘展示模型对比、各项指标、执行轨迹和失败类别。
+
+不要直接将默认演示部署暴露到公网。对外服务应配置 `TOOLCALL_API_KEY` 或上游身份认证、TLS、访问控制、备份和监控。轨迹包含任务提示词与工具输出，可能含敏感信息。详见[架构与运行边界](docs/architecture.md)。
+
+## 扩展与测试
+
+```python
+from toolcall_bench import LLMBackend, BenchmarkRunner
+
+class MyBackend(LLMBackend):
+    name = "my-backend"
+
+    def generate(self, messages, tools):
+        return my_client.complete(
+            messages=messages,
+            tools=[tool.to_openai_tool() for tool in tools],
+        )
+
+report = BenchmarkRunner(adapter=MyBackend()).run("benchmarks/demo.jsonl")
+```
+
+增加工具可参考[自定义工具示例](examples/custom_tool.py)。提交前运行 `python -m pytest`、`ruff check .`，并在 `dashboard/` 中运行 `npm ci && npm run build`。CI 会检查 Python 代码、测试和前端构建。
+
+当前边界：每道题最多执行一次工具调用；只支持实用的 JSON Schema 子集；最终答案采用确定性比较而非语义评审；每题只有一组标准工具调用；尚无多租户权限、数据库迁移和数据保留策略。这些限制不应被视为已达到完整企业生产环境要求。
+
+项目采用 [MIT 许可证](LICENSE)。

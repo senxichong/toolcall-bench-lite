@@ -1,0 +1,74 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: toolcall
+      POSTGRES_USER: toolcall
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U toolcall -d toolcall"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build: .
+    environment: &service_environment
+      TOOLCALL_DATABASE_URL: postgresql+psycopg://toolcall:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/toolcall
+      TOOLCALL_REDIS_URL: redis://redis:6379/0
+      TOOLCALL_DEMO_MODE: "false"
+      TOOLCALL_API_KEY: ${TOOLCALL_API_KEY:-}
+      TOOLCALL_CORS_ORIGINS: ${TOOLCALL_CORS_ORIGINS:-}
+      TOOLCALL_BENCH_MODEL: ${TOOLCALL_BENCH_MODEL:-}
+      TOOLCALL_BENCH_BASE_URL: ${TOOLCALL_BENCH_BASE_URL:-}
+      TOOLCALL_BENCH_API_KEY: ${TOOLCALL_BENCH_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["celery", "-A", "toolcall_bench.service.worker:celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
+    environment: *service_environment
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build: ./dashboard
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3000:80"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
